@@ -1,0 +1,28 @@
+import { after, before, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { newDb } from 'pg-mem';
+import supertest from 'supertest';
+
+process.env.NODE_ENV='test';process.env.CSRF_SECRET=randomBytes(48).toString('hex');process.env.CLIENT_ORIGIN='http://localhost:5173';process.env.AUTH_REQUIRE_EMAIL_VERIFICATION='false';
+const db=newDb();db.public.registerFunction({name:'gen_random_uuid',returns:'uuid',implementation:randomUUID,impure:true});const {Pool}=db.adapters.createPg();const pg=new Pool();
+await pg.query(`
+create table public.users(id uuid primary key default gen_random_uuid(),email text unique,full_name text,institution text,job_title text,phone text,email_verified_at timestamptz,is_active boolean default true,created_at timestamptz default now(),updated_at timestamptz default now());
+create table public.roles(id uuid primary key default gen_random_uuid(),name text unique);
+create table public.user_roles(user_id uuid references public.users(id),role_id uuid references public.roles(id),primary key(user_id,role_id));
+create table public.conferences(id uuid primary key default gen_random_uuid(),title text not null,acronym text,description text,venue text,timezone text default 'Asia/Dhaka',start_date date,end_date date,submission_deadline timestamptz,status text default 'draft',conference_mode text default 'in_person',organizer_user_id uuid,created_by uuid,created_at timestamptz default now(),updated_at timestamptz default now());
+create table public.conference_memberships(id uuid primary key default gen_random_uuid(),conference_id uuid,user_id uuid,role_id uuid,assigned_by uuid,created_at timestamptz default now(),unique(conference_id,user_id,role_id));
+create table public.auth_sessions(token_hash text primary key,user_id uuid,csrf_token text,expires_at timestamptz,created_at timestamptz default now(),last_seen_at timestamptz default now());
+create table public.audit_logs(id uuid primary key default gen_random_uuid(),actor_user_id uuid,action text,entity_type text,entity_id uuid,details jsonb,ip_address text,created_at timestamptz default now());
+create table public.conference_deadlines(id uuid primary key default gen_random_uuid(),conference_id uuid,deadline_type text,deadline_at timestamptz,created_at timestamptz default now(),updated_at timestamptz default now(),unique(conference_id,deadline_type));
+`);
+await pg.query("insert into public.roles(name) values('super_admin'),('attendee'),('conference_admin')");
+const {configurePoolForTests}=await import('../src/db/pool.js');configurePoolForTests(pg);const {hashToken}=await import('../src/auth/crypto.js');const {createApp}=await import('../src/app.js');const app=createApp();
+let admin,attendee,adminCookies,attendeeCookies,conferenceId;
+async function userWith(role){const u=(await pg.query('insert into public.users(email,full_name,email_verified_at) values($1,$2,now()) returning id',[`${role}-${randomUUID()}@test.invalid`,role])).rows[0];await pg.query('insert into public.user_roles(user_id,role_id) select $1,id from public.roles where name=$2',[u.id,role]);const token=randomBytes(32).toString('hex'),csrf=randomBytes(32).toString('hex');await pg.query('insert into public.auth_sessions(token_hash,user_id,csrf_token,expires_at) values($1,$2,$3,now()+interval \'1 hour\')',[hashToken(token),u.id,csrf]);return {id:u.id,cookie:`bup_session=${token}; bup_csrf=${csrf}`,csrf};}
+before(async()=>{admin=await userWith('super_admin');attendee=await userWith('attendee');adminCookies=admin.cookie;attendeeCookies=attendee.cookie;});
+after(async()=>{await pg.end();});
+function authorized(agent,csrf){return agent.set('Cookie',agent===undefined?'':(csrf===admin.csrf?adminCookies:attendeeCookies)).set('Origin',process.env.CLIENT_ORIGIN).set('X-CSRF-Token',csrf);}
+test('non-admin cannot create conference or read admin records',async()=>{const response=await authorized(supertest(app).post('/api/admin/conferences'),attendee.csrf).send({title:'No access',startDate:'2027-01-01',endDate:'2027-01-02'});assert.equal(response.status,403);const listing=await supertest(app).get('/api/admin/stats').set('Cookie',attendeeCookies);assert.equal(listing.status,403);});
+test('Super Admin creates, publishes, filters, and audits a conference',async()=>{const agent=supertest(app);const created=await authorized(agent.post('/api/admin/conferences'),admin.csrf).send({title:'Research Forum',acronym:'RF',description:'Research conference',venue:'BUP',startDate:'2027-05-10',endDate:'2027-05-11',conferenceMode:'hybrid',deadlines:[{type:'abstract',at:'2027-02-01T10:00:00.000Z'}]});assert.equal(created.status,201,created.text);conferenceId=created.body.data.id;assert.equal(created.body.data.status,'draft');const published=await authorized(agent.post(`/api/admin/conferences/${conferenceId}/lifecycle`),admin.csrf).send({status:'published'});assert.equal(published.status,200,published.text);assert.equal(published.body.data.status,'published');const filtered=await agent.get('/api/admin/conferences?status=published&q=Research').set('Cookie',adminCookies);assert.equal(filtered.status,200,filtered.text);assert.equal(filtered.body.data[0].id,conferenceId);const logs=await agent.get('/api/admin/audit-logs').set('Cookie',adminCookies);assert.equal(logs.status,200,logs.text);assert.ok(logs.body.data.some(item=>item.action==='conference.published'));});
+test('conference edit API saves validated updates',async()=>{const resp=await authorized(supertest(app).patch(`/api/admin/conferences/${conferenceId}`),admin.csrf).send({title:'Edited Research Forum'});assert.equal(resp.status,200,resp.text);});

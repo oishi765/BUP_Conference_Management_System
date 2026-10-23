@@ -1,0 +1,2 @@
+export function notFoundHandler(req, res, next) { const error = new Error(`Route not found: ${req.method} ${req.originalUrl}`); error.status = 404; next(error); }
+export function errorHandler(error, req, res, _next) { const status = Number.isInteger(error.status) ? error.status : 500; if (status >= 500) console.error(error); res.status(status).json({ error: { message: status >= 500 ? 'An unexpected server error occurred.' : error.message, ...(process.env.NODE_ENV !== 'production' && status >= 500 ? { detail: error.message } : {}) } }); }

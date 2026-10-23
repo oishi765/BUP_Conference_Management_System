@@ -1,0 +1,1 @@
+.author-notification{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:14px 2px;border-top:1px solid #edf1ee}.author-notification p{margin:5px 0;color:#5e7167}.author-notification small{color:#7a8981}.author-notification.is-read{opacity:.72}
